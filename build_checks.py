@@ -189,11 +189,38 @@ def _clean_text(s: str) -> str:
     return _WS_RE.sub(" ", s).strip()
 
 
+def _to_id_str(v: object) -> str:
+    """Номер клиента/партнёра: int/float/научная запись Excel → обычная цифра."""
+    if v is None:
+        return ""
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    if isinstance(v, (float, np.floating)):
+        if np.isnan(v):
+            return ""
+        if abs(float(v) - round(float(v))) < 1e-6:
+            return str(int(round(float(v))))
+        return _clean_text(str(v))
+    s = _clean_text(str(v))
+    if s.lower() in ("", "nan", "none", "<na>", "nat"):
+        return ""
+    compact = s.lower().replace(" ", "")
+    if "e" in compact:
+        try:
+            f = float(compact)
+            if abs(f - round(f)) < 1e-6:
+                return str(int(round(f)))
+        except ValueError:
+            pass
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
 def _norm(v: object) -> str:
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return ""
-    s = _clean_text(str(v))
-    return s[:-2] if s.endswith(".0") else s
+    return _to_id_str(v)
 
 
 def _norm_cust(v: object) -> str:
@@ -204,18 +231,16 @@ def _norm_cust(v: object) -> str:
 
 
 def _ns(s: pd.Series) -> pd.Series:
-    return (
-        s.fillna("")
-        .astype(str)
-        .str.replace(_WS_RE, " ", regex=True)
-        .str.strip()
-        .apply(lambda x: x[:-2] if x.endswith(".0") else x)
-    )
+    return s.map(_to_id_str)
 
 
 def _nc(s: pd.Series) -> pd.Series:
     base = _ns(s)
     return base.where(~base.str.match(r"^\d+$"), base.str.lstrip("0").replace("", "0"))
+
+
+def _zfill10(s: pd.Series) -> pd.Series:
+    return s.where(~s.str.match(r"^\d+$"), s.str.zfill(10))
 
 
 def _align_merge_keys(df: pd.DataFrame) -> pd.DataFrame:

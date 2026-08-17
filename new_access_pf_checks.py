@@ -41,6 +41,7 @@ from build_checks import (
     _mismatch_sheet_label,
     _align_merge_keys,
     _nc,
+    _zfill10,
     _norm,
     _ns,
     _prep_bill_to_sheet,
@@ -224,6 +225,20 @@ def attach_partner_access(
     # Access: LEFT JOIN без Distinct — возможны many-to-many
     result = result.merge(sub, on="Customer", how="left")
 
+    miss_mask = result[prefix].fillna("").astype(str).str.strip().eq("")
+    if miss_mask.any() and not pf.empty:
+        pf_z = pf.drop_duplicates(subset=["Customer"], keep="first").copy()
+        pf_z["_z"] = _zfill10(pf_z["Customer"])
+        miss = result.loc[miss_mask, ["Customer"]].copy()
+        miss["_z"] = _zfill10(miss["Customer"])
+        filled = miss.merge(pf_z.drop(columns=["Customer"]), on="_z", how="left")
+        filled.index = miss.index
+        got = filled[prefix].fillna("").astype(str).str.strip().ne("")
+        if got.any():
+            for c in pcols:
+                if c in filled.columns:
+                    result.loc[got.index[got], c] = filled.loc[got, c].to_numpy()
+
     for c in pcols:
         if c not in result.columns:
             result[c] = ""
@@ -235,11 +250,18 @@ def attach_partner_access(
         )
 
     matched = int(result[prefix].ne("").sum()) if prefix in result.columns else 0
+    miss_n = len(result) - matched
     print(
         f"[new_access] {prefix}: join {matched}/{len(result)} "
         f"(партнёрских строк {len(pf)})",
         flush=True,
     )
+    if miss_n:
+        sample = result.loc[result[prefix].eq(""), "Customer"].astype(str).head(15).tolist()
+        print(
+            f"[new_access] {prefix}: нет номера у {miss_n} клиентов, примеры: {sample}",
+            flush=True,
+        )
 
     return result
 
