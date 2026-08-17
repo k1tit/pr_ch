@@ -39,6 +39,7 @@ from build_checks import (
     _excel_sheet_name_safe,
     _get_file,
     _mismatch_sheet_label,
+    _align_merge_keys,
     _nc,
     _norm,
     _ns,
@@ -166,8 +167,9 @@ def attach_partner_access(
         FROM partner pf LEFT JOIN Base_DelDup d ON pf.KTONR = d.Customer
       ) ON b.Customer = sub.Customer
     """
-    result = base_dd.copy()
-    lookup_src = master_lookup if master_lookup is not None else base_dd
+    result = _align_merge_keys(base_dd.copy())
+    lookup_src = master_lookup if master_lookup is not None else result
+    lookup_src = _align_merge_keys(lookup_src.copy()) if lookup_src is not None else result
     ob = _col(lookup_src, "OrBlk", "OrBlk 1")
     ob1 = _col(lookup_src, "OrBlk1", "OrBlk 1")
     pcols = [prefix, f"{prefix} Name", f"{prefix} Tax Number 1", f"{prefix} OrBlk1", f"{prefix} OrBlk2"]
@@ -185,11 +187,22 @@ def attach_partner_access(
     if ob1:
         rename_d[ob1] = "_lk_ob2"
     d = lookup.rename(columns=rename_d)
+    if "_lk_cust" in d.columns:
+        d["_lk_cust"] = _nc(d["_lk_cust"])
 
-    # Access не делает Distinct/First по KUNNR — дубли партнёра размножают строки
-    pf = partner_df[["KUNNR", "KTONR"]].copy()
+    if "KUNNR" not in partner_df.columns or "KTONR" not in partner_df.columns:
+        kunnr = _col(partner_df, "KUNNR", "Customer", "Sold-to")
+        ktonr = _col(partner_df, "KTONR", "KUNN2", "Partner", prefix)
+        if not kunnr or not ktonr:
+            for c in pcols:
+                result[c] = ""
+            return result
+        pf = partner_df[[kunnr, ktonr]].rename(columns={kunnr: "KUNNR", ktonr: "KTONR"}).copy()
+    else:
+        pf = partner_df[["KUNNR", "KTONR"]].copy()
     pf["KUNNR"] = _nc(pf["KUNNR"])
     pf["KTONR"] = _nc(pf["KTONR"])
+    pf = pf[pf["KUNNR"].ne("") & pf["KTONR"].ne("")].copy()
     pf = pf.rename(columns={"KUNNR": "Customer", "KTONR": prefix})
 
     sub = pf.merge(d, left_on=prefix, right_on="_lk_cust", how="left")
@@ -220,6 +233,13 @@ def attach_partner_access(
             .str.strip()
             .replace({"nan": "", "None": "", "<NA>": ""})
         )
+
+    matched = int(result[prefix].ne("").sum()) if prefix in result.columns else 0
+    print(
+        f"[new_access] {prefix}: join {matched}/{len(result)} "
+        f"(партнёрских строк {len(pf)})",
+        flush=True,
+    )
 
     return result
 
@@ -534,12 +554,20 @@ def save_pair_excel(
     print(f"[new_access] сохранено: {out_file}", flush=True)
 
 
-def process_sorg(folder: str, exc_keys: set[tuple[str, str]]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def process_sorg(
+    folder: str,
+    exc_keys: set[tuple[str, str]],
+    master_lookup: pd.DataFrame | None = None,
+    loaded: tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Access-цепочка для одного SOrg:
     Base → DelDup → Exception → BP/PY/ZY → фильтры → Checks → Errors / Bill-to
     """
-    base_raw, bp_df, py_df, zy_df = load_sorg(folder)
+    if loaded is None:
+        base_raw, bp_df, py_df, zy_df = load_sorg(folder)
+    else:
+        base_raw, bp_df, py_df, zy_df = loaded
     if base_raw.empty:
         return pd.DataFrame(), pd.DataFrame(), base_raw
 
@@ -547,7 +575,8 @@ def process_sorg(folder: str, exc_keys: set[tuple[str, str]]) -> tuple[pd.DataFr
     if base.empty:
         return pd.DataFrame(), pd.DataFrame(), base_raw
 
-    merged = merge_all_partners_access(base, bp_df, py_df, zy_df, master_lookup=base_raw)
+    lk = master_lookup if master_lookup is not None and not master_lookup.empty else base_raw
+    merged = merge_all_partners_access(base, bp_df, py_df, zy_df, master_lookup=lk)
     filtered = apply_filters_access(merged)
     if filtered.empty:
         return pd.DataFrame(), pd.DataFrame(), base_raw
@@ -642,11 +671,24 @@ def _merge_sorg_results(
     return not missing
 
 
+def _pair_master_lookup(
+    loaded: dict[str, tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]],
+) -> pd.DataFrame | None:
+    bases = [raw[0] for raw in loaded.values() if raw[0] is not None and not raw[0].empty]
+    if not bases:
+        return None
+    return pd.concat(bases, ignore_index=True)
+
+
 def process_pair(pair_name: str, folders: list[str], exc_df: pd.DataFrame) -> bool:
     """Последовательная обработка (для отладки и --no-parallel)."""
     exc_keys = exception_keys(exc_df)
     results: list[tuple[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]] = []
     failed: list[str] = []
+    loaded: dict[str, tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]] = {}
+    for folder in folders:
+        loaded[folder] = load_sorg(folder)
+    pair_lk = _pair_master_lookup(loaded)
     iterator = folders
     if tqdm is not None:
         iterator = tqdm(folders, desc=pair_name, unit="SOrg", leave=True)
@@ -657,7 +699,17 @@ def process_pair(pair_name: str, folders: list[str], exc_df: pd.DataFrame) -> bo
         else:
             print(f"[new_access] {pair_name}: {msg}", flush=True)
         try:
-            results.append((folder, process_sorg(folder, exc_keys)))
+            results.append(
+                (
+                    folder,
+                    process_sorg(
+                        folder,
+                        exc_keys,
+                        master_lookup=pair_lk,
+                        loaded=loaded.get(folder),
+                    ),
+                )
+            )
         except Exception as exc:
             failed.append(folder)
             print(f"[new_access] SO {folder}: ОШИБКА — {exc}", flush=True)
@@ -684,19 +736,42 @@ async def process_pair_async(pair_name: str, folders: list[str], exc_df: pd.Data
         flush=True,
     )
 
+    async def _load(folder: str) -> tuple[str, object]:
+        try:
+            return folder, await async_io(load_sorg, folder)
+        except Exception as exc:
+            print(f"[new_access] SO {folder}: ОШИБКА загрузки — {exc}", flush=True)
+            traceback.print_exc()
+            return folder, exc
+
+    loaded_raw = await gather_limited([_load(f) for f in folders], limit=workers)
+    loaded: dict[str, tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]] = {}
+    failed: list[str] = []
+    for folder, item in loaded_raw:
+        if isinstance(item, Exception):
+            failed.append(folder)
+        else:
+            loaded[folder] = item
+    pair_lk = _pair_master_lookup(loaded)
+
     async def _one(folder: str) -> tuple[str, object]:
         print(f"[new_access] {pair_name}: SO {folder}: чтение и проверки…", flush=True)
         try:
-            res = await async_io(process_sorg, folder, exc_keys)
+            res = await async_io(
+                process_sorg,
+                folder,
+                exc_keys,
+                pair_lk,
+                loaded.get(folder),
+            )
             return folder, res
         except Exception as exc:
             print(f"[new_access] SO {folder}: ОШИБКА — {exc}", flush=True)
             traceback.print_exc()
             return folder, exc
 
-    raw = await gather_limited([_one(f) for f in folders], limit=workers)
+    raw = await gather_limited([_one(f) for f in loaded], limit=workers)
     results: list[tuple[str, tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]] = []
-    failed: list[str] = []
     for folder, item in raw:
         if isinstance(item, Exception):
             failed.append(folder)

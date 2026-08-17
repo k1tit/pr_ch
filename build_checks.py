@@ -182,12 +182,17 @@ MISMATCH_EXPORT_COLS = [
 ]
 
 _CYR = re.compile(r"[А-Яа-яЁё]")
+_WS_RE = re.compile(r"[\u00a0\u2000-\u200b\ufeff]+")
+
+
+def _clean_text(s: str) -> str:
+    return _WS_RE.sub(" ", s).strip()
 
 
 def _norm(v: object) -> str:
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return ""
-    s = str(v).strip()
+    s = _clean_text(str(v))
     return s[:-2] if s.endswith(".0") else s
 
 
@@ -199,7 +204,13 @@ def _norm_cust(v: object) -> str:
 
 
 def _ns(s: pd.Series) -> pd.Series:
-    return s.fillna("").astype(str).str.strip().apply(lambda x: x[:-2] if x.endswith(".0") else x)
+    return (
+        s.fillna("")
+        .astype(str)
+        .str.replace(_WS_RE, " ", regex=True)
+        .str.strip()
+        .apply(lambda x: x[:-2] if x.endswith(".0") else x)
+    )
 
 
 def _nc(s: pd.Series) -> pd.Series:
@@ -223,9 +234,9 @@ def _align_merge_keys(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _col(df: pd.DataFrame, *candidates: str) -> str | None:
-    lo = {c.casefold(): c for c in df.columns}
+    lo = {str(c).casefold().strip(): c for c in df.columns}
     for c in candidates:
-        found = lo.get(c.casefold())
+        found = lo.get(c.casefold().strip())
         if found is not None:
             return found
     return None
@@ -536,16 +547,40 @@ def _read_base(path: Path, folder: str, *, allow_com: bool = False) -> pd.DataFr
 
 
 def _normalize_partner_df(df: pd.DataFrame, folder: str, *, kind: str = "partner") -> pd.DataFrame:
-    kunnr = _col(df, "KUNNR", "Customer", "Sold-to")
-    ktonr = _col(df, "KTONR", "BP", "PY", "ZY")
-    if not kunnr or not ktonr:
+    if df is None or df.empty:
         return pd.DataFrame(columns=["KUNNR", "KTONR", "_folder"])
-    out = df[[kunnr, ktonr]].rename(columns={kunnr: "KUNNR", ktonr: "KTONR"})
+    out_src = df.copy()
+    out_src.columns = [str(c).strip() for c in out_src.columns]
+    kunnr = _col(
+        out_src,
+        "KUNNR",
+        "Customer",
+        "Sold-to",
+        "Sold-to party",
+        "Sold to",
+        "Sold-To Party",
+    )
+    ktonr = _col(out_src, "KTONR", "KUNN2", "Partner", "Partner Number", "BP", "PY", "ZY")
+    if not kunnr or not ktonr:
+        print(
+            f"[build_checks] SO {folder} {kind}: нет колонок KUNNR/KTONR "
+            f"({list(out_src.columns)[:12]})",
+            flush=True,
+        )
+        return pd.DataFrame(columns=["KUNNR", "KTONR", "_folder"])
+    out = out_src[[kunnr, ktonr]].rename(columns={kunnr: "KUNNR", ktonr: "KTONR"})
     out["KUNNR"] = _nc(out["KUNNR"])
     out["KTONR"] = _nc(out["KTONR"])
     out["_folder"] = folder
-    # Access не Distinct по KUNNR — дубли партнёрских строк сохраняем
-    return out.dropna(subset=["KUNNR"])
+    before = len(out)
+    out = out[out["KUNNR"].ne("") & out["KTONR"].ne("")].copy()
+    dropped = before - len(out)
+    if dropped:
+        print(
+            f"[build_checks] SO {folder} {kind}: отброшено {dropped} строк без KUNNR/KTONR",
+            flush=True,
+        )
+    return out
 
 
 def _read_partner(
