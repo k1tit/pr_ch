@@ -52,6 +52,7 @@ from build_checks import (
     _write_exception_sheet,
     _read_base,
     _read_partner,
+    _read_all_partners,
     _so_col,
     _unique_excel_sheet_name,
     collect_and_persist_global_exception,
@@ -315,10 +316,6 @@ def _load_sorg_from_excel(
     if not f_base:
         return pd.DataFrame(), None, None, None
 
-    f_bp = _get_file(fp, "*BP*.xlsx")
-    f_py = _get_file(fp, "*PY*.xlsx")
-    f_zy = _get_file(fp, "*ZY*.xlsx")
-
     def _file_mb(path: Path | None) -> str:
         if not path or not path.is_file():
             return "?"
@@ -331,35 +328,36 @@ def _load_sorg_from_excel(
         print(f"[new_access] SO {folder}: Base готов, {len(df)} строк, {time.perf_counter() - t0:.0f} с", flush=True)
         return df
 
-    def _load_partner(path: Path | None, label: str) -> pd.DataFrame | None:
-        if not path:
-            print(f"[new_access] SO {folder}: {label} не найден", flush=True)
-            return None
-        print(f"[new_access] SO {folder}: читаю {label} {path.name} ({_file_mb(path)})…", flush=True)
+    def _load_partner(label: str, pattern: str) -> pd.DataFrame | None:
+        print(f"[new_access] SO {folder}: читаю {label}…", flush=True)
         t0 = time.perf_counter()
-        df = _read_partner(path, folder, kind=label)
+        df = _read_all_partners(fp, folder, pattern, label, allow_com=True)
         rows = len(df) if df is not None and not df.empty else 0
         print(f"[new_access] SO {folder}: {label} готов, {rows} строк, {time.perf_counter() - t0:.0f} с", flush=True)
         return df
 
     if parallel_enabled():
-        jobs: dict[str, object] = {"base": _load_base}
-        if f_bp:
-            jobs["BP"] = lambda: _load_partner(f_bp, "BP")
-        if f_py:
-            jobs["PY"] = lambda: _load_partner(f_py, "PY")
-        if f_zy:
-            jobs["ZY"] = lambda: _load_partner(f_zy, "ZY")
+        jobs: dict[str, object] = {
+            "base": _load_base,
+            "BP": lambda: _load_partner("BP", "*BP*.xlsx"),
+            "PY": lambda: _load_partner("PY", "*PY*.xlsx"),
+            "ZY": lambda: _load_partner("ZY", "*ZY*.xlsx"),
+        }
         with ThreadPoolExecutor(max_workers=min(4, len(jobs)), thread_name_prefix=f"so{folder}") as pool:
             futs = {k: pool.submit(fn) for k, fn in jobs.items()}
             base = futs["base"].result()
-            bp = futs["BP"].result() if "BP" in futs else None
-            py = futs["PY"].result() if "PY" in futs else None
-            zy = futs["ZY"].result() if "ZY" in futs else None
+            bp = futs["BP"].result()
+            py = futs["PY"].result()
+            zy = futs["ZY"].result()
         return base, bp, py, zy
 
     base = _load_base()
-    return base, _load_partner(f_bp, "BP"), _load_partner(f_py, "PY"), _load_partner(f_zy, "ZY")
+    return (
+        base,
+        _load_partner("BP", "*BP*.xlsx"),
+        _load_partner("PY", "*PY*.xlsx"),
+        _load_partner("ZY", "*ZY*.xlsx"),
+    )
 
 
 def load_sorg(folder: str) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
@@ -371,6 +369,15 @@ def load_sorg(folder: str) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFr
         if base.empty:
             return pd.DataFrame(), None, None, None
         base = dedupe_base_access(base)
+        def _rekey(df: pd.DataFrame | None) -> pd.DataFrame | None:
+            if df is None or df.empty or "KUNNR" not in df.columns:
+                return df
+            out = df.copy()
+            out["KUNNR"] = _nc(out["KUNNR"])
+            if "KTONR" in out.columns:
+                out["KTONR"] = _nc(out["KTONR"])
+            return out[out["KUNNR"].ne("") & out["KTONR"].ne("")]
+        bp, py, zy = _rekey(bp), _rekey(py), _rekey(zy)
         print(f"[new_access] SO {folder}: из DuckDB — base {len(base)} строк", flush=True)
         return base, bp, py, zy
     return _load_sorg_from_excel(folder)
@@ -576,6 +583,43 @@ def save_pair_excel(
     print(f"[new_access] сохранено: {out_file}", flush=True)
 
 
+def _diagnose_empty_partners(
+    folder: str,
+    errors: pd.DataFrame,
+    bp_df: pd.DataFrame | None,
+    py_df: pd.DataFrame | None,
+    zy_df: pd.DataFrame | None,
+) -> None:
+    """По пустым BP/PY/ZY на листе несоответствий: клиент есть в файле как KUNNR или только как KTONR."""
+    if errors is None or errors.empty or "Customer" not in errors.columns:
+        return
+
+    def _blank(col: str) -> pd.Series:
+        if col not in errors.columns:
+            return pd.Series(True, index=errors.index)
+        return errors[col].fillna("").astype(str).str.strip().eq("")
+
+    empty_all = _blank("BP") & _blank("PY") & _blank("ZY")
+    n = int(empty_all.sum())
+    if n == 0:
+        return
+    print(
+        f"[new_access] SO {folder}: на несоответствиях {n} строк с пустыми BP+PY+ZY",
+        flush=True,
+    )
+    files = {"BP": bp_df, "PY": py_df, "ZY": zy_df}
+    for cust in _nc(errors.loc[empty_all, "Customer"]).drop_duplicates().head(20):
+        bits = [f"Customer={cust}"]
+        for label, df in files.items():
+            if df is None or df.empty:
+                bits.append(f"{label}:нет файла")
+                continue
+            as_kunnr = int((df["KUNNR"] == cust).sum()) if "KUNNR" in df.columns else 0
+            as_ktonr = int((df["KTONR"] == cust).sum()) if "KTONR" in df.columns else 0
+            bits.append(f"{label}:KUNNR={as_kunnr}/KTONR={as_ktonr}")
+        print("  " + " | ".join(bits), flush=True)
+
+
 def process_sorg(
     folder: str,
     exc_keys: set[tuple[str, str]],
@@ -607,6 +651,7 @@ def process_sorg(
     # Access ErrorsOnly: Comment не пустой; без Distinct и без фильтра по BP Name
     errors = checked[checked["Comment MD Analyst"].fillna("").astype(str).str.strip() != ""].copy()
     bill_to = build_bill_to_access(checked, base_raw)
+    _diagnose_empty_partners(folder, errors, bp_df, py_df, zy_df)
 
     # Диагностика лавины «Ship-to … без OB M»: после OrBlk-swap у BP OrBlk1 должно быть много M.
     bp_ob = (

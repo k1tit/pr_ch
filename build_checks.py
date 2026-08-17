@@ -289,22 +289,27 @@ def _partner_lookup_extra_columns(base_lookup: pd.DataFrame, prefix: str) -> dic
     return extra
 
 
-def _get_file(folder: Path, pattern: str) -> Path | None:
-    """Самый новый файл по дате изменения (если в папке несколько совпадений)."""
+def _get_files(folder: Path, pattern: str) -> list[Path]:
+    """Все подходящие xlsx в папке (без lock-файлов Excel), новые первыми."""
     if not folder.exists():
-        return None
+        return []
     files = [
         p for p in folder.glob(pattern)
-        if not p.name.startswith("~$")  # lock-файл Excel при открытой книге — не xlsx
+        if not p.name.startswith("~$")
         and not p.name.startswith(".")
     ]
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _get_file(folder: Path, pattern: str) -> Path | None:
+    """Самый новый файл по дате изменения (если в папке несколько совпадений)."""
+    files = _get_files(folder, pattern)
     if not files:
         return None
     if len(files) > 1:
-        files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
         print(
             f"[build_checks] В {folder} найдено {len(files)} файлов «{pattern}», "
-            f"берём новый: {files[0].name}",
+            f"берём новый: {files[0].name} (остальные тоже читаются для BP/PY/ZY)",
             flush=True,
         )
     return files[0]
@@ -617,6 +622,31 @@ def _read_partner(
 ) -> pd.DataFrame:
     df = _read_excel_checked(path, kind=kind, folder=folder, allow_com=allow_com)
     return _normalize_partner_df(df, folder, kind=kind)
+
+
+def _read_all_partners(
+    folder_path: Path,
+    folder: str,
+    pattern: str,
+    label: str,
+    *,
+    allow_com: bool = False,
+) -> pd.DataFrame | None:
+    """Читает все *BP*/*PY*/*ZY* в папке, не только самый новый файл."""
+    files = _get_files(folder_path, pattern)
+    if not files:
+        return None
+    parts: list[pd.DataFrame] = []
+    for path in files:
+        print(f"[build_checks] SO {folder}: {label} ← {path.name}", flush=True)
+        df = _read_partner(path, folder, kind=label, allow_com=allow_com)
+        if df is not None and not df.empty:
+            parts.append(df)
+    if not parts:
+        return None
+    out = pd.concat(parts, ignore_index=True)
+    out = out.drop_duplicates(subset=["KUNNR", "KTONR"], keep="first")
+    return out
 
 
 def load_exception(base_dir: Path) -> pd.DataFrame:

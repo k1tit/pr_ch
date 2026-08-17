@@ -17,6 +17,7 @@ import pandas as pd
 from build_checks import (
     BASE_DIR,
     _get_file,
+    _get_files,
     _normalize_base_df,
     _normalize_partner_df,
     _read_excel_checked,
@@ -76,31 +77,35 @@ def read_sorg_raw_from_excel(
     if not f_base:
         return pd.DataFrame(), None, None, None
 
-    f_bp = _get_file(fp, "*BP*.xlsx")
-    f_py = _get_file(fp, "*PY*.xlsx")
-    f_zy = _get_file(fp, "*ZY*.xlsx")
-
     print(f"[staging] SO {folder}: читаю Base {f_base.name} ({_file_mb(f_base)})…", flush=True)
     t0 = time.perf_counter()
     base = _normalize_base_df(_read_excel_with_com_fallback(f_base, kind="Base", folder=folder), folder)
     print(f"[staging] SO {folder}: Base {len(base)} строк, {time.perf_counter() - t0:.0f} с", flush=True)
 
-    def _part(path: Path | None, label: str) -> pd.DataFrame | None:
-        if not path:
+    def _part(label: str, pattern: str) -> pd.DataFrame | None:
+        files = _get_files(fp, pattern)
+        if not files:
             print(f"[staging] SO {folder}: {label} не найден", flush=True)
             return None
-        print(f"[staging] SO {folder}: читаю {label} {path.name} ({_file_mb(path)})…", flush=True)
+        parts: list[pd.DataFrame] = []
         t1 = time.perf_counter()
-        df = _normalize_partner_df(
-            _read_excel_with_com_fallback(path, kind=label, folder=folder),
-            folder,
-            kind=label,
-        )
-        rows = len(df) if not df.empty else 0
-        print(f"[staging] SO {folder}: {label} {rows} строк, {time.perf_counter() - t1:.0f} с", flush=True)
-        return df if not df.empty else None
+        for path in files:
+            print(f"[staging] SO {folder}: читаю {label} {path.name} ({_file_mb(path)})…", flush=True)
+            df = _normalize_partner_df(
+                _read_excel_with_com_fallback(path, kind=label, folder=folder),
+                folder,
+                kind=label,
+            )
+            if df is not None and not df.empty:
+                parts.append(df)
+        if not parts:
+            print(f"[staging] SO {folder}: {label} пустой", flush=True)
+            return None
+        out = pd.concat(parts, ignore_index=True).drop_duplicates(subset=["KUNNR", "KTONR"], keep="first")
+        print(f"[staging] SO {folder}: {label} {len(out)} строк, {time.perf_counter() - t1:.0f} с", flush=True)
+        return out
 
-    return base, _part(f_bp, "BP"), _part(f_py, "PY"), _part(f_zy, "ZY")
+    return base, _part("BP", "*BP*.xlsx"), _part("PY", "*PY*.xlsx"), _part("ZY", "*ZY*.xlsx")
 
 
 class StagingDB:
