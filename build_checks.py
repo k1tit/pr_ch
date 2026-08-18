@@ -499,7 +499,41 @@ def _dedupe_column_labels(columns) -> list[str]:
     return out
 
 
-def _normalize_orblk_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _orblk_m_count(df: pd.DataFrame, col: str) -> int:
+    if col not in df.columns:
+        return 0
+    return int(df[col].fillna("").astype(str).str.upper().str.strip().eq("M").sum())
+
+
+def _swap_orblk_pair(df: pd.DataFrame, first: str, second: str, *, folder: str = "") -> pd.DataFrame:
+    """
+    Access: first=OrBlk (Bill-to = M), second=второй блок.
+    Макрос часто пишет M во второй колонке — тогда меняем значения местами.
+    """
+    if first not in df.columns or second not in df.columns:
+        return df
+    m_first = _orblk_m_count(df, first)
+    m_second = _orblk_m_count(df, second)
+    if m_second > m_first:
+        out = df.copy()
+        tmp = out[first].copy()
+        out[first] = out[second]
+        out[second] = tmp
+        print(
+            f"[build_checks] SO {folder or '?'}: OrBlk swap {first}↔{second} "
+            f"(M: {m_first} → {m_second})",
+            flush=True,
+        )
+        return out
+    print(
+        f"[build_checks] SO {folder or '?'}: OrBlk без swap "
+        f"({first} M={m_first}, {second} M={m_second})",
+        flush=True,
+    )
+    return df
+
+
+def _normalize_orblk_columns(df: pd.DataFrame, folder: str = "") -> pd.DataFrame:
     """
     Внутренний вид Access: OrBlk (Bill-to = M) + OrBlk1 (второй блок).
 
@@ -507,11 +541,8 @@ def _normalize_orblk_columns(df: pd.DataFrame) -> pd.DataFrame:
       2-й столбец файла = Access OrBlk (M)
       1-й столбец файла = Access OrBlk1
 
-    Без swap M остаётся во 2-й колонке → десятки тысяч ложных
-    «Ship-to прикреплён к BP без OB M» (типично 3802 с OrBlk.1).
-
-    Уже Access (OrBlk+OrBlk1 без OrBlk2/OrBlk.1) — не трогаем.
-    В отчёт: OrBlk→OrBlk1, OrBlk1→OrBlk2 (to_export_orblk_names).
+    Новые выгрузки иногда уже называются OrBlk+OrBlk1, но M всё ещё во 2-й колонке.
+    Тогда нельзя выходить «уже Access» по именам — смотрим, где больше M.
     """
     if df is None or df.empty:
         return df
@@ -520,21 +551,22 @@ def _normalize_orblk_columns(df: pd.DataFrame) -> pd.DataFrame:
     if len(out.columns) != len(set(map(str, out.columns))):
         out.columns = _dedupe_column_labels(out.columns)
 
-    # OrBlk.1 (дубль заголовка) = второй столбец макроса = OrBlk2
     if "OrBlk.1" in out.columns and "OrBlk2" not in out.columns:
         out = out.rename(columns={"OrBlk.1": "OrBlk2"})
     elif "OrBlk.1" in out.columns and "OrBlk2" in out.columns:
         out = out.drop(columns=["OrBlk.1"])
 
-    # Уже Access OrBlk+OrBlk1 — без макросного второго столбца
-    if "OrBlk1" in out.columns and "OrBlk2" not in out.columns:
-        return out
-
     if "OrBlk" not in out.columns:
         return out
 
     if "OrBlk2" in out.columns:
-        return out.rename(columns={"OrBlk": "OrBlk1", "OrBlk2": "OrBlk"})
+        out = _swap_orblk_pair(out, "OrBlk", "OrBlk2", folder=folder)
+        if "OrBlk1" not in out.columns:
+            out = out.rename(columns={"OrBlk2": "OrBlk1"})
+        return out
+
+    if "OrBlk1" in out.columns:
+        return _swap_orblk_pair(out, "OrBlk", "OrBlk1", folder=folder)
 
     return out
 
@@ -552,7 +584,7 @@ def to_export_orblk_names(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalize_base_df(df: pd.DataFrame, folder: str) -> pd.DataFrame:
-    df = _normalize_orblk_columns(df)
+    df = _normalize_orblk_columns(df, folder=folder)
     so = _so_col(df)
     if so and so != "SO":
         df = df.rename(columns={so: "SO"})
